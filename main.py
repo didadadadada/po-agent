@@ -134,18 +134,18 @@ async def health():
 @app.post("/slack/events")
 async def slack_events(request: Request):
     body_bytes = await request.body()
+    payload = json.loads(body_bytes)
 
-    # Slack 서명 검증
+    # URL 검증 챌린지 — 서명 검증 전에 처리해야 함
+    # Slack이 Request URL 등록 시 서명 없이 challenge 요청을 보낼 수 있음
+    if payload.get("type") == "url_verification":
+        return JSONResponse({"challenge": payload["challenge"]})
+
+    # 일반 이벤트는 서명 검증 수행
     timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
     signature = request.headers.get("X-Slack-Signature", "")
     if not _verify_slack_signature(body_bytes, timestamp, signature):
         raise HTTPException(status_code=403, detail="Invalid signature")
-
-    payload = json.loads(body_bytes)
-
-    # URL 검증 챌린지
-    if payload.get("type") == "url_verification":
-        return JSONResponse({"challenge": payload["challenge"]})
 
     event = payload.get("event", {})
     event_id = payload.get("event_id", "")
