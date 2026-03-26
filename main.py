@@ -3,7 +3,7 @@ import hmac
 import json
 import os
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 
 import anthropic
@@ -61,23 +61,67 @@ def _verify_slack_signature(request_body: bytes, timestamp: str, signature: str)
     return hmac.compare_digest(expected, signature)
 
 
-# ── PO 에이전트 시스템 프롬프트 ───────────────────────────────────────────────
-SYSTEM_PROMPT = """당신은 경험 많은 PO 에이전트입니다. 사용자의 요청에 따라 PRD, 유저 스토리를 작성하고,
-필요하면 웹 리서치를 먼저 진행한 뒤 근거 있는 문서를 작성합니다.
-작성한 문서는 Notion에 저장할 수 있습니다.
+# ── 채널별 대화 히스토리 ──────────────────────────────────────────────────────
+# key: channel_id, value: deque of {"role": ..., "content": ...}
+# 채널별 최근 10턴(user+assistant 쌍)을 메모리에 유지
+_HISTORY_MAX_TURNS = 10
+_channel_history: dict[str, deque] = {}
 
-도구 사용 지침:
-- 최신 시장 정보나 경쟁사 분석이 필요하면 web_search를 먼저 사용하세요.
-- 문서 작성이 완료되면 사용자가 원할 경우 notion_write_page로 저장하세요.
-- Notion 페이지 내용을 참고해야 할 때는 notion_read_page를 사용하세요.
-- 응답은 항상 한국어로 작성합니다."""
+
+def _get_history(channel: str) -> list[dict]:
+    """채널 히스토리를 리스트로 반환 (없으면 빈 리스트)"""
+    return list(_channel_history.get(channel, []))
+
+
+def _append_history(channel: str, user_msg: str, assistant_msg: str) -> None:
+    """user/assistant 한 쌍을 히스토리에 추가, 최대 턴 수 초과 시 오래된 것 제거"""
+    if channel not in _channel_history:
+        _channel_history[channel] = deque()
+    history = _channel_history[channel]
+    history.append({"role": "user", "content": user_msg})
+    history.append({"role": "assistant", "content": assistant_msg})
+    # 최대 턴 수(user+assistant 쌍) 초과 시 앞에서 2개씩 제거
+    while len(history) > _HISTORY_MAX_TURNS * 2:
+        history.popleft()
+        history.popleft()
+
+
+# ── PO 에이전트 시스템 프롬프트 ───────────────────────────────────────────────
+SYSTEM_PROMPT = """당신은 10년 경력의 시니어 프로덕트 오너(PO)입니다.
+
+## 행동 원칙
+- 요청을 받으면 반드시 web_search 도구로 시장 현황, 경쟁사, 트렌드를 먼저 조사하세요.
+- 리서치 없이 문서를 작성하지 마세요. 모든 주장은 조사 근거에 기반해야 합니다.
+- 문서 작성이 완료되면 반드시 notion_write_page 도구로 Notion에 자동 저장하세요.
+- 저장 후 Notion 링크를 답변에 포함하세요.
+- 답변은 항상 한국어로 작성하세요.
+
+## PRD 작성 형식
+PRD 요청 시 아래 순서를 반드시 지키세요:
+1. **배경**: 이 기능/제품이 필요한 배경과 맥락
+2. **문제 정의**: 해결하려는 핵심 문제와 타겟 사용자
+3. **핵심 기능**: 구현할 기능 목록과 상세 설명
+4. **성공 지표**: 성공을 측정할 정량적 KPI/OKR
+5. **범위 외(Out of Scope)**: 이번 버전에서 다루지 않는 것
+
+## 유저 스토리 작성 형식
+유저 스토리 요청 시 아래 형식을 반드시 지키세요:
+- 형식: "[사용자 유형]로서, [목적/이유]를 위해, [행동/기능]을 하고 싶다."
+- 각 스토리에 인수 조건(Acceptance Criteria)을 Given/When/Then 형식으로 작성하세요.
+
+## 도구 사용 지침
+- web_search: 시장 조사, 경쟁사 분석, 트렌드 파악 시 사용 (문서 작성 전 필수)
+- notion_write_page: 완성된 문서 저장 시 사용 (작성 완료 후 자동 실행)
+- notion_read_page: 기존 Notion 페이지 내용 참조 시 사용
+- notion_append_to_page: 기존 페이지에 내용 추가 시 사용"""
 
 
 # ── Claude agentic loop ──────────────────────────────────────────────────────
 
-async def run_po_agent(user_message: str) -> str:
-    """Claude tool use 루프를 돌려 최종 응답 반환"""
-    messages = [{"role": "user", "content": user_message}]
+async def run_po_agent(user_message: str, channel: str) -> str:
+    """채널 히스토리를 포함한 Claude tool use 루프, 최종 응답 반환"""
+    # 이전 대화 히스토리 + 현재 메시지
+    messages = _get_history(channel) + [{"role": "user", "content": user_message}]
 
     while True:
         response = anthropic_client.messages.create(
@@ -91,7 +135,10 @@ async def run_po_agent(user_message: str) -> str:
         # 도구 호출이 없으면 종료
         if response.stop_reason == "end_turn":
             text_blocks = [b.text for b in response.content if b.type == "text"]
-            return "\n".join(text_blocks)
+            answer = "\n".join(text_blocks)
+            # 채널 히스토리에 이번 턴 저장 (user 원본 메시지 + assistant 최종 텍스트)
+            _append_history(channel, user_message, answer)
+            return answer
 
         # tool_use 블록 처리
         if response.stop_reason == "tool_use":
@@ -111,7 +158,9 @@ async def run_po_agent(user_message: str) -> str:
         else:
             # 예상치 못한 stop_reason
             text_blocks = [b.text for b in response.content if b.type == "text"]
-            return "\n".join(text_blocks) or "(응답 없음)"
+            answer = "\n".join(text_blocks) or "(응답 없음)"
+            _append_history(channel, user_message, answer)
+            return answer
 
 
 # ── FastAPI 앱 ────────────────────────────────────────────────────────────────
@@ -186,9 +235,9 @@ async def slack_events(request: Request):
     except SlackApiError:
         pass
 
-    # Claude 에이전트 실행
+    # Claude 에이전트 실행 (채널 ID를 넘겨 히스토리 맥락 유지)
     try:
-        answer = await run_po_agent(user_message)
+        answer = await run_po_agent(user_message, channel)
     except Exception as e:
         answer = f"오류가 발생했습니다: {e}"
 
