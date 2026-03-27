@@ -61,6 +61,10 @@ def _verify_slack_signature(request_body: bytes, timestamp: str, signature: str)
     return hmac.compare_digest(expected, signature)
 
 
+# ── 봇이 참여한 스레드 추적 ──────────────────────────────────────────────────
+# 봇이 한 번이라도 답변한 thread_ts를 기억해 멘션 없이도 반응하게 함
+_bot_threads: set[str] = set()
+
 # ── 채널별 대화 히스토리 ──────────────────────────────────────────────────────
 # key: channel_id, value: deque of {"role": ..., "content": ...}
 # 채널별 최근 10턴(user+assistant 쌍)을 메모리에 유지
@@ -329,20 +333,38 @@ async def slack_events(request: Request):
         return JSONResponse({"ok": True})
 
     event_type = event.get("type", "")
+    subtype = event.get("subtype", "")
+    channel_type = event.get("channel_type", "")
 
-    # app_mention 이벤트만 처리
-    if event_type != "app_mention":
-        return JSONResponse({"ok": True})
-
-    # 봇 자신의 메시지 무시
-    if event.get("bot_id"):
+    # 봇 메시지·편집·삭제 무시
+    if event.get("bot_id") or subtype in ("bot_message", "message_changed", "message_deleted"):
         return JSONResponse({"ok": True})
 
     channel = event.get("channel", "")
     thread_ts = event.get("thread_ts") or event.get("ts", "")
     raw_text: str = event.get("text", "")
 
-    # <@BOTID> 멘션 부분 제거
+    # ── 반응 여부 결정 ─────────────────────────────────────────────────────
+    # 1) @멘션 (app_mention)
+    # 2) DM (message.im): channel_type == "im" 이거나 채널 ID가 'D'로 시작
+    # 3) 봇이 이미 참여한 스레드 안의 메시지 (멘션 불필요)
+    is_dm = channel_type == "im" or channel.startswith("D")
+    in_bot_thread = (
+        event_type == "message"
+        and bool(event.get("thread_ts"))
+        and event.get("thread_ts") in _bot_threads
+    )
+
+    if event_type == "app_mention":
+        pass  # 항상 반응
+    elif event_type == "message" and is_dm:
+        pass  # DM은 멘션 불필요
+    elif in_bot_thread:
+        pass  # 봇 참여 스레드는 멘션 불필요
+    else:
+        return JSONResponse({"ok": True})
+
+    # <@BOTID> 멘션 부분 제거 (app_mention, DM 공통)
     user_message = " ".join(
         w for w in raw_text.split() if not w.startswith("<@")
     ).strip()
@@ -375,6 +397,8 @@ async def slack_events(request: Request):
                 text=chunk,
                 mrkdwn=True,
             )
+        # 봇이 답한 스레드를 기억해 다음 메시지부터 멘션 없이 반응
+        _bot_threads.add(thread_ts)
     except SlackApiError as e:
         print(f"Slack 전송 오류: {e}")
 
