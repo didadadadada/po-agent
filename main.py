@@ -277,6 +277,16 @@ PRD 요청 시 아래 10개 섹션을 순서대로 작성하세요:
 
 _NOTION_TOOLS = {"notion_write_page", "notion_append_to_page"}
 
+# 문서 응답 감지용 시그널
+_DOC_SIGNALS = ["## ", "### ", "PRD", "유저 스토리", "성공 지표", "인수 조건", "Acceptance Criteria", "Out of Scope"]
+
+
+def _is_document_response(text: str) -> bool:
+    """PRD·유저 스토리 등 문서가 포함된 응답인지 휴리스틱으로 판단"""
+    if len(text) < 300:
+        return False
+    return sum(1 for s in _DOC_SIGNALS if s in text) >= 2
+
 
 async def run_po_agent(
     user_message: str,
@@ -288,6 +298,8 @@ async def run_po_agent(
     notify_fn: Slack에 중간 상태 메시지를 보내는 콜백 (선택).
     """
     messages = _get_history(channel) + [{"role": "user", "content": user_message}]
+    notion_saved = False   # 이번 루프에서 notion_write_page 호출 여부
+    notion_forced = False  # 강제 저장 재시도를 이미 했는지 (무한루프 방지)
 
     while True:
         response = anthropic_client.messages.create(
@@ -298,14 +310,30 @@ async def run_po_agent(
             messages=messages,
         )
 
-        # 도구 호출이 없으면 종료
+        # ── end_turn 처리 ─────────────────────────────────────────────────
         if response.stop_reason == "end_turn":
             text_blocks = [b.text for b in response.content if b.type == "text"]
             answer = "\n".join(text_blocks)
+
+            # Claude가 문서를 작성했는데 Notion 저장을 안 한 경우 → 1회 강제 요청
+            if not notion_saved and not notion_forced and _is_document_response(answer):
+                notion_forced = True
+                print("[AGENT] 문서 감지 but Notion 미저장 → 저장 강제 요청")
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "위에서 작성한 문서를 notion_write_page 도구를 사용해서 "
+                        "지금 바로 Notion에 저장해줘. "
+                        "parent_page_id는 비워도 돼 (환경변수에서 자동으로 읽음)."
+                    ),
+                })
+                continue  # 루프 재진입
+
             _append_history(channel, user_message, answer)
             return answer
 
-        # tool_use 블록 처리
+        # ── tool_use 처리 ─────────────────────────────────────────────────
         if response.stop_reason == "tool_use":
             messages.append({"role": "assistant", "content": response.content})
 
@@ -315,6 +343,8 @@ async def run_po_agent(
                     continue
 
                 is_notion = block.name in _NOTION_TOOLS
+                if block.name == "notion_write_page":
+                    notion_saved = True
 
                 # Notion 저장 시작 알림
                 if is_notion and notify_fn:
@@ -322,21 +352,16 @@ async def run_po_agent(
                     notify_fn(f"📝 노션에 {label} 중이에요, 잠깐만요!")
 
                 print(f"[TOOL] {block.name} 호출 — input keys: {list(block.input.keys())}")
-                try:
-                    result = await execute_tool(block.name, block.input)
-                    print(f"[TOOL] {block.name} 완료 — result: {result[:120]!r}")
 
-                    # Notion 저장 성공 알림
-                    if is_notion and notify_fn:
+                # execute_tool은 내부에서 예외를 문자열로 변환하므로 결과 문자열로 성패 판단
+                result = await execute_tool(block.name, block.input)
+                print(f"[TOOL] {block.name} 결과 — {result[:200]!r}")
+
+                if is_notion and notify_fn:
+                    if result.startswith("[도구 오류]"):
+                        notify_fn(f"노션 저장 실패했어요 😅 에러: {result}")
+                    else:
                         notify_fn(f"✅ 저장 완료! {result}")
-
-                except Exception as exc:
-                    result = f"[도구 오류] {block.name}: {exc}"
-                    print(f"[TOOL] {block.name} 실패 — {exc}")
-
-                    # Notion 저장 실패 알림
-                    if is_notion and notify_fn:
-                        notify_fn(f"⚠️ 노션 저장 실패: {exc}")
 
                 tool_results.append({
                     "type": "tool_result",
