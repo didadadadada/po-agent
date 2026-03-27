@@ -245,14 +245,48 @@ PRD 요청 시 아래 10개 섹션을 순서대로 작성하세요:
 - **web_search**: 리서치 계획의 각 조사 질문마다 1회 실행 (문서 작성 전 필수)
 - **notion_write_page**: 완성된 문서 저장 (작성 완료 즉시 자동 실행, Notion 링크 공유)
 - **notion_read_page**: 기존 Notion 페이지 내용 참조 시
-- **notion_append_to_page**: 기존 페이지에 내용 추가 시"""
+- **notion_append_to_page**: 기존 페이지에 내용 추가 시
+
+---
+
+## 말투 & 커뮤니케이션 스타일
+
+당신은 똑똑하고 솔직한 시니어 PO야. 팀 동료처럼 자연스럽게 대화해.
+
+**기본 원칙:**
+- 기계처럼 딱딱하게 말하지 말고, 실제 동료처럼 자연스럽게 대화해
+- 격식체보다 친근하게, 근데 프로답게 (예: "~해요" 체 사용)
+- 불필요한 인사말이나 "안녕하세요, 저는 PO 에이전트입니다" 같은 자기소개 생략
+
+**작업 시작 전 예고:**
+- 리서치가 필요한 작업은 바로 시작하기 전에 먼저 알려줘
+- 예: "이거 시장 조사가 좀 필요해서 5분 정도 걸릴 것 같아요, 잠깐만요! 🔍"
+- 예: "PRD 작성 전에 경쟁사 리서치 먼저 할게요!"
+
+**Notion 저장 단계별 안내:**
+- 저장 시작 전: "노션에 저장할게요 📝" (시스템이 별도로 알림을 보냄)
+- 저장 완료 후: 링크와 함께 "저장 완료! ✅"
+
+**금지 표현:**
+- "물론입니다!", "알겠습니다!", "훌륭한 질문이에요!" 등 과도한 호응
+- "~드리겠습니다" 같은 지나치게 격식체인 표현
+- 근거 없는 칭찬이나 빈말"""
 
 
 # ── Claude agentic loop ──────────────────────────────────────────────────────
 
-async def run_po_agent(user_message: str, channel: str) -> str:
-    """채널 히스토리를 포함한 Claude tool use 루프, 최종 응답 반환"""
-    # 이전 대화 히스토리 + 현재 메시지
+_NOTION_TOOLS = {"notion_write_page", "notion_append_to_page"}
+
+
+async def run_po_agent(
+    user_message: str,
+    channel: str,
+    notify_fn=None,  # Callable[[str], None] | None — Slack 실시간 알림용
+) -> str:
+    """채널 히스토리를 포함한 Claude tool use 루프, 최종 응답 반환.
+
+    notify_fn: Slack에 중간 상태 메시지를 보내는 콜백 (선택).
+    """
     messages = _get_history(channel) + [{"role": "user", "content": user_message}]
 
     while True:
@@ -268,7 +302,6 @@ async def run_po_agent(user_message: str, channel: str) -> str:
         if response.stop_reason == "end_turn":
             text_blocks = [b.text for b in response.content if b.type == "text"]
             answer = "\n".join(text_blocks)
-            # 채널 히스토리에 이번 턴 저장 (user 원본 메시지 + assistant 최종 텍스트)
             _append_history(channel, user_message, answer)
             return answer
 
@@ -278,13 +311,38 @@ async def run_po_agent(user_message: str, channel: str) -> str:
 
             tool_results = []
             for block in response.content:
-                if block.type == "tool_use":
+                if block.type != "tool_use":
+                    continue
+
+                is_notion = block.name in _NOTION_TOOLS
+
+                # Notion 저장 시작 알림
+                if is_notion and notify_fn:
+                    label = "저장" if block.name == "notion_write_page" else "추가"
+                    notify_fn(f"📝 노션에 {label} 중이에요, 잠깐만요!")
+
+                print(f"[TOOL] {block.name} 호출 — input keys: {list(block.input.keys())}")
+                try:
                     result = await execute_tool(block.name, block.input)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
+                    print(f"[TOOL] {block.name} 완료 — result: {result[:120]!r}")
+
+                    # Notion 저장 성공 알림
+                    if is_notion and notify_fn:
+                        notify_fn(f"✅ 저장 완료! {result}")
+
+                except Exception as exc:
+                    result = f"[도구 오류] {block.name}: {exc}"
+                    print(f"[TOOL] {block.name} 실패 — {exc}")
+
+                    # Notion 저장 실패 알림
+                    if is_notion and notify_fn:
+                        notify_fn(f"⚠️ 노션 저장 실패: {exc}")
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result,
+                })
 
             messages.append({"role": "user", "content": tool_results})
         else:
@@ -407,9 +465,19 @@ async def slack_events(request: Request):
     except SlackApiError:
         pass
 
-    # Claude 에이전트 실행 (채널 ID를 넘겨 히스토리 맥락 유지)
+    # Slack 실시간 알림 콜백 (Notion 저장 단계 안내용)
+    def _notify(msg: str) -> None:
+        try:
+            kwargs: dict = {"channel": channel, "text": msg}
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+            slack_client.chat_postMessage(**kwargs)
+        except SlackApiError as err:
+            print(f"[notify] Slack 전송 오류: {err}")
+
+    # Claude 에이전트 실행 (채널 히스토리 + 실시간 알림 포함)
     try:
-        answer = await run_po_agent(user_message, channel)
+        answer = await run_po_agent(user_message, channel, notify_fn=_notify)
     except Exception as e:
         answer = f"오류가 발생했습니다: {e}"
 

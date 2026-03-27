@@ -1,7 +1,11 @@
+import asyncio
+import logging
 import os
 import re
 import httpx
 from notion_client import Client as NotionClient
+
+logger = logging.getLogger(__name__)
 
 # ── Tavily 웹 검색 ────────────────────────────────────────────────────────────
 
@@ -131,15 +135,16 @@ def notion_read_page(page_id: str) -> str:
     return "\n".join(lines) if lines else "(빈 페이지)"
 
 
-def notion_write_page(title: str, content: str, parent_page_id: str | None = None) -> str:
-    """Notion에 새 페이지를 생성하고 URL 반환"""
+def _notion_write_page_sync(title: str, content: str, parent_page_id: str | None) -> str:
+    """동기 Notion 페이지 생성 (asyncio.to_thread 에서 호출)"""
+    logger.info("[Notion] 페이지 생성 시작: title=%r parent=%r", title, parent_page_id)
+    print(f"[Notion] 페이지 생성 시작 — title={title!r}")
+
     notion = _notion()
 
-    # parent 설정
     if parent_page_id:
         parent = {"type": "page_id", "page_id": parent_page_id}
     else:
-        # 환경변수로 기본 부모 페이지 지정 가능
         default_parent = os.environ.get("NOTION_PARENT_PAGE_ID")
         if default_parent:
             parent = {"type": "page_id", "page_id": default_parent}
@@ -150,6 +155,8 @@ def notion_write_page(title: str, content: str, parent_page_id: str | None = Non
             )
 
     children = markdown_to_notion_blocks(content)
+    logger.info("[Notion] 블록 변환 완료: %d 블록", len(children))
+    print(f"[Notion] 블록 변환 완료: {len(children)}개")
 
     page = notion.pages.create(
         parent=parent,
@@ -159,15 +166,49 @@ def notion_write_page(title: str, content: str, parent_page_id: str | None = Non
         children=children,
     )
     url = page.get("url", "")
+    logger.info("[Notion] 페이지 생성 성공: url=%s", url)
+    print(f"[Notion] 페이지 생성 성공: {url}")
     return f"Notion 페이지 저장 완료: {url}"
 
 
-def notion_append_to_page(page_id: str, content: str) -> str:
-    """기존 Notion 페이지에 내용 추가"""
+async def notion_write_page(title: str, content: str, parent_page_id: str | None = None) -> str:
+    """Notion에 새 페이지를 생성하고 URL 반환 (30초 타임아웃)"""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_notion_write_page_sync, title, content, parent_page_id),
+            timeout=30,
+        )
+    except asyncio.TimeoutError:
+        msg = "[Notion 오류] 저장 타임아웃 (30초 초과) — 나중에 다시 시도해주세요."
+        logger.error(msg)
+        print(msg)
+        raise TimeoutError(msg)
+
+
+def _notion_append_sync(page_id: str, content: str) -> str:
+    """동기 Notion 페이지 추가 (asyncio.to_thread 에서 호출)"""
+    logger.info("[Notion] 페이지 추가 시작: page_id=%r", page_id)
+    print(f"[Notion] 페이지 추가 시작 — page_id={page_id!r}")
     notion = _notion()
     children = markdown_to_notion_blocks(content)
     notion.blocks.children.append(block_id=page_id, children=children)
+    logger.info("[Notion] 페이지 추가 성공: %d 블록", len(children))
+    print(f"[Notion] 페이지 추가 성공: {len(children)}개 블록")
     return f"페이지 {page_id}에 내용 추가 완료"
+
+
+async def notion_append_to_page(page_id: str, content: str) -> str:
+    """기존 Notion 페이지에 내용 추가 (30초 타임아웃)"""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_notion_append_sync, page_id, content),
+            timeout=30,
+        )
+    except asyncio.TimeoutError:
+        msg = "[Notion 오류] 추가 타임아웃 (30초 초과) — 나중에 다시 시도해주세요."
+        logger.error(msg)
+        print(msg)
+        raise TimeoutError(msg)
 
 
 # ── Claude tool 스키마 정의 ───────────────────────────────────────────────────
@@ -251,13 +292,13 @@ async def execute_tool(tool_name: str, tool_input: dict) -> str:
         elif tool_name == "notion_read_page":
             return notion_read_page(tool_input["page_id"])
         elif tool_name == "notion_write_page":
-            return notion_write_page(
+            return await notion_write_page(
                 title=tool_input["title"],
                 content=tool_input["content"],
                 parent_page_id=tool_input.get("parent_page_id"),
             )
         elif tool_name == "notion_append_to_page":
-            return notion_append_to_page(
+            return await notion_append_to_page(
                 page_id=tool_input["page_id"],
                 content=tool_input["content"],
             )
