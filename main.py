@@ -26,6 +26,9 @@ SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
+# 봇 자신의 user_id (lifespan에서 auth.test로 채워짐)
+BOT_USER_ID: str = ""
+
 # ── 이벤트 중복 처리 방지 캐시 ────────────────────────────────────────────────
 # 최근 500개 event_id를 LRU 방식으로 기억
 _processed_events: OrderedDict[str, float] = OrderedDict()
@@ -296,7 +299,13 @@ async def run_po_agent(user_message: str, channel: str) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("PO Agent 서버 시작")
+    global BOT_USER_ID
+    try:
+        result = slack_client.auth_test()
+        BOT_USER_ID = result["user_id"]
+        print(f"PO Agent 서버 시작 — Bot user_id: {BOT_USER_ID}")
+    except Exception as e:
+        print(f"auth.test 실패 (BOT_USER_ID 미설정): {e}")
     yield
     print("PO Agent 서버 종료")
 
@@ -335,19 +344,27 @@ async def slack_events(request: Request):
     event_type = event.get("type", "")
     subtype = event.get("subtype", "")
     channel_type = event.get("channel_type", "")
+    event_user = event.get("user", "")
 
-    # 봇 메시지·편집·삭제 무시
-    if event.get("bot_id") or subtype in ("bot_message", "message_changed", "message_deleted"):
+    print(f"[EVENT] type={event_type} subtype={subtype!r} channel_type={channel_type!r} user={event_user} bot_id={event.get('bot_id')!r}")
+
+    # ── 봇 자신의 메시지 무시 ─────────────────────────────────────────────
+    # bot_id 있음: Slack이 봇 메시지로 표시
+    # subtype 필터: bot_message / message_changed / message_deleted
+    # user == BOT_USER_ID: bot_id 없이 user 필드만 있는 봇 메시지 (DM 루프 방지)
+    if (
+        event.get("bot_id")
+        or subtype in ("bot_message", "message_changed", "message_deleted")
+        or (BOT_USER_ID and event_user == BOT_USER_ID)
+    ):
         return JSONResponse({"ok": True})
 
     channel = event.get("channel", "")
-    thread_ts = event.get("thread_ts") or event.get("ts", "")
-    raw_text: str = event.get("text", "")
 
     # ── 반응 여부 결정 ─────────────────────────────────────────────────────
     # 1) @멘션 (app_mention)
-    # 2) DM (message.im): channel_type == "im" 이거나 채널 ID가 'D'로 시작
-    # 3) 봇이 이미 참여한 스레드 안의 메시지 (멘션 불필요)
+    # 2) DM: channel_type == "im" 또는 채널 ID가 'D'로 시작
+    # 3) 봇이 이미 참여한 스레드 안의 메시지
     is_dm = channel_type == "im" or channel.startswith("D")
     in_bot_thread = (
         event_type == "message"
@@ -364,7 +381,16 @@ async def slack_events(request: Request):
     else:
         return JSONResponse({"ok": True})
 
-    # <@BOTID> 멘션 부분 제거 (app_mention, DM 공통)
+    raw_text: str = event.get("text", "")
+
+    # DM 직접 메시지는 thread_ts 없이 답변 (스레드 생성 방지 → 루프 차단)
+    # 스레드 메시지이거나 채널 멘션이면 thread 유지
+    if is_dm and not event.get("thread_ts"):
+        thread_ts = None
+    else:
+        thread_ts = event.get("thread_ts") or event.get("ts", "")
+
+    # <@BOTID> 멘션 부분 제거
     user_message = " ".join(
         w for w in raw_text.split() if not w.startswith("<@")
     ).strip()
@@ -374,11 +400,10 @@ async def slack_events(request: Request):
 
     # 처리 중 메시지 전송
     try:
-        slack_client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=":hourglass_flowing_sand: 요청을 처리 중입니다...",
-        )
+        msg_kwargs: dict = {"channel": channel, "text": ":hourglass_flowing_sand: 요청을 처리 중입니다..."}
+        if thread_ts:
+            msg_kwargs["thread_ts"] = thread_ts
+        slack_client.chat_postMessage(**msg_kwargs)
     except SlackApiError:
         pass
 
@@ -391,14 +416,13 @@ async def slack_events(request: Request):
     # 결과 전송 (Slack 메시지 최대 3000자 분할)
     try:
         for chunk in _split_message(answer, 3000):
-            slack_client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=chunk,
-                mrkdwn=True,
-            )
+            send_kwargs: dict = {"channel": channel, "text": chunk, "mrkdwn": True}
+            if thread_ts:
+                send_kwargs["thread_ts"] = thread_ts
+            slack_client.chat_postMessage(**send_kwargs)
         # 봇이 답한 스레드를 기억해 다음 메시지부터 멘션 없이 반응
-        _bot_threads.add(thread_ts)
+        if thread_ts:
+            _bot_threads.add(thread_ts)
     except SlackApiError as e:
         print(f"Slack 전송 오류: {e}")
 
