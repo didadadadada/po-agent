@@ -1,4 +1,5 @@
 import os
+import re
 import httpx
 from notion_client import Client as NotionClient
 
@@ -26,6 +27,88 @@ async def tavily_search(query: str, max_results: int = 5) -> str:
     for i, r in enumerate(data.get("results", []), 1):
         lines.append(f"{i}. [{r['title']}]({r['url']})\n{r.get('content', '')[:300]}")
     return "\n\n".join(lines) if lines else "검색 결과 없음"
+
+
+# ── 마크다운 → Notion 블록 변환 ────────────────────────────────────────────────
+
+def _parse_inline(text: str) -> list[dict]:
+    """**bold** 구문을 bold annotation으로 변환, 나머지는 plain text"""
+    parts = re.split(r'\*\*(.+?)\*\*', text)
+    rich = []
+    for i, part in enumerate(parts):
+        if not part:
+            continue
+        rich.append({
+            "type": "text",
+            "text": {"content": part[:2000]},
+            "annotations": {"bold": bool(i % 2)},
+        })
+    return rich or [{"type": "text", "text": {"content": ""}}]
+
+
+def markdown_to_notion_blocks(markdown: str) -> list[dict]:
+    """마크다운 텍스트를 Notion API 블록 리스트로 변환 (최대 100개)"""
+    blocks: list[dict] = []
+    for line in markdown.split("\n"):
+        s = line.rstrip()
+
+        # divider
+        if s in ("---", "***", "___"):
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
+            continue
+
+        # heading_3 (### 먼저 확인)
+        if s.startswith("### "):
+            blocks.append({
+                "object": "block", "type": "heading_3",
+                "heading_3": {"rich_text": _parse_inline(s[4:])},
+            })
+            continue
+
+        # heading_2
+        if s.startswith("## "):
+            blocks.append({
+                "object": "block", "type": "heading_2",
+                "heading_2": {"rich_text": _parse_inline(s[3:])},
+            })
+            continue
+
+        # heading_1
+        if s.startswith("# "):
+            blocks.append({
+                "object": "block", "type": "heading_1",
+                "heading_1": {"rich_text": _parse_inline(s[2:])},
+            })
+            continue
+
+        # bulleted_list_item  (- 또는 *)
+        if re.match(r'^[-*] ', s):
+            blocks.append({
+                "object": "block", "type": "bulleted_list_item",
+                "bulleted_list_item": {"rich_text": _parse_inline(s[2:])},
+            })
+            continue
+
+        # numbered_list_item  (1. 2. ...)
+        m = re.match(r'^\d+\.\s+(.*)', s)
+        if m:
+            blocks.append({
+                "object": "block", "type": "numbered_list_item",
+                "numbered_list_item": {"rich_text": _parse_inline(m.group(1))},
+            })
+            continue
+
+        # 빈 줄 스킵
+        if not s:
+            continue
+
+        # paragraph
+        blocks.append({
+            "object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": _parse_inline(s)},
+        })
+
+    return blocks[:100]  # Notion API 한 번에 최대 100개
 
 
 # ── Notion 헬퍼 ───────────────────────────────────────────────────────────────
@@ -66,17 +149,7 @@ def notion_write_page(title: str, content: str, parent_page_id: str | None = Non
                 "parent_page_id 인자를 넘기거나 NOTION_PARENT_PAGE_ID 환경변수를 설정하세요."
             )
 
-    # 내용을 단락 블록으로 변환 (줄 단위)
-    def make_paragraph(text: str) -> dict:
-        return {
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
-            },
-        }
-
-    children = [make_paragraph(line) for line in content.split("\n") if line.strip()][:100]
+    children = markdown_to_notion_blocks(content)
 
     page = notion.pages.create(
         parent=parent,
@@ -92,17 +165,7 @@ def notion_write_page(title: str, content: str, parent_page_id: str | None = Non
 def notion_append_to_page(page_id: str, content: str) -> str:
     """기존 Notion 페이지에 내용 추가"""
     notion = _notion()
-
-    def make_paragraph(text: str) -> dict:
-        return {
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
-            },
-        }
-
-    children = [make_paragraph(line) for line in content.split("\n") if line.strip()][:100]
+    children = markdown_to_notion_blocks(content)
     notion.blocks.children.append(block_id=page_id, children=children)
     return f"페이지 {page_id}에 내용 추가 완료"
 
